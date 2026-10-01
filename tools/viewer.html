@@ -1,0 +1,293 @@
+<title>ForgeGPU Step-Through</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Chivo:wght@500;700;800&family=IBM+Plex+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: a logic-analyzer bench — transport + narration on top, then three
+   instrument panes (program, lane registers, memory) side by side. Each lane
+   owns one colour everywhere, so "one instruction, four results" is visible. */
+:root {
+  --bg: #eef1f4;          /* datasheet paper, cool */
+  --panel: #ffffff;
+  --ink: #18212b;
+  --muted: #5d6a78;
+  --line: #d3dae2;
+  --accent: #b5720a;      /* amber: the instruction executing now */
+  --accent-soft: #fbefd9;
+  --lane0: #2563c9; --lane1: #c2410c; --lane2: #0f8a5f; --lane3: #8b3fb8;
+  --bad: #b42318;
+  --font-display: "Chivo", "Helvetica Neue", Arial, sans-serif;
+  --font-body: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #11161c; --panel: #19212a; --ink: #e4eaf0; --muted: #93a1b0; --line: #2b3642;
+    --accent: #f0a93a; --accent-soft: #3a2c14;
+    --lane0: #6ea2ff; --lane1: #ff8a4c; --lane2: #3fcf95; --lane3: #c78af0; --bad: #ff6b5e;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #11161c; --panel: #19212a; --ink: #e4eaf0; --muted: #93a1b0; --line: #2b3642;
+  --accent: #f0a93a; --accent-soft: #3a2c14;
+  --lane0: #6ea2ff; --lane1: #ff8a4c; --lane2: #3fcf95; --lane3: #c78af0; --bad: #ff6b5e;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body { background: var(--bg); color: var(--ink); font: 15px/1.5 var(--font-body); margin: 0; }
+.wrap { max-width: 1240px; margin: 0 auto; padding-inline: 16px; padding-block: 20px 40px; display: grid; gap: 16px; }
+header { display: flex; flex-wrap: wrap; align-items: end; justify-content: space-between; gap: 12px 24px; }
+h1 { font: 800 clamp(22px, 3vw, 30px)/1.1 var(--font-display); margin: 0; letter-spacing: -0.01em; text-wrap: balance; }
+.sub { color: var(--muted); margin: 4px 0 0; }
+.picker { display: flex; flex-wrap: wrap; gap: 6px; }
+.picker button { font: 500 13px var(--font-body); padding: 6px 12px; border-radius: 999px; border: 1px solid var(--line); background: var(--panel); color: var(--ink); cursor: pointer; }
+.picker button[aria-pressed="true"] { background: var(--ink); color: var(--bg); border-color: var(--ink); }
+.stats { display: flex; flex-wrap: wrap; gap: 8px 20px; font: 13px var(--font-mono); color: var(--muted); }
+.stats b { color: var(--ink); font-weight: 600; font-variant-numeric: tabular-nums; }
+
+.transport { display: grid; grid-template-columns: auto 1fr auto; gap: 12px; align-items: center; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px 14px; }
+.btns { display: flex; gap: 6px; }
+.btns button { font: 600 13px var(--font-body); min-width: 40px; height: 34px; padding: 0 10px; border: 1px solid var(--line); border-radius: 7px; background: var(--bg); color: var(--ink); cursor: pointer; }
+.btns button.primary { background: var(--accent); border-color: var(--accent); color: #1b1203; min-width: 72px; }
+button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+input[type=range] { width: 100%; accent-color: var(--accent); }
+.pos { font: 13px var(--font-mono); color: var(--muted); white-space: nowrap; font-variant-numeric: tabular-nums; }
+
+.narr { background: var(--accent-soft); border-radius: 10px; padding: 12px 16px; display: grid; gap: 4px; }
+.narr .instr { font: 600 17px var(--font-mono); }
+.narr .instr .where { font: 400 13px var(--font-body); color: var(--muted); margin-left: 10px; }
+.narr p { margin: 0; max-width: 72ch; }
+
+.grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.25fr) minmax(0, 1fr); gap: 16px; align-items: start; }
+@media (max-width: 980px) { .grid { grid-template-columns: minmax(0, 1fr); } .transport { grid-template-columns: 1fr; } }
+section.pane { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; min-width: 0; }
+.pane h2 { font: 700 12px var(--font-display); text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin: 0; padding: 12px 14px 8px; display: flex; justify-content: space-between; gap: 8px; }
+.pane .body { padding: 0 6px 10px; overflow-x: auto; }
+
+.prog { list-style: none; margin: 0; padding: 0; font: 13px/1.75 var(--font-mono); }
+.prog li { display: grid; grid-template-columns: 2.4em 1fr; padding: 0 8px; border-radius: 5px; white-space: pre; }
+.prog li .n { color: var(--muted); text-align: right; padding-right: 10px; font-variant-numeric: tabular-nums; }
+.prog li.cur { background: var(--accent-soft); box-shadow: inset 3px 0 0 var(--accent); font-weight: 600; }
+
+table.regs { border-collapse: collapse; width: 100%; font: 13px var(--font-mono); font-variant-numeric: tabular-nums; }
+.regs th { font: 600 12px var(--font-body); padding: 4px 8px; text-align: right; border-bottom: 1px solid var(--line); }
+.regs th:first-child, .regs td:first-child { text-align: left; color: var(--muted); }
+.regs td { padding: 2px 8px; text-align: right; border-radius: 4px; }
+.regs td.zero { color: var(--line); }
+.regs td.hit { font-weight: 600; color: #fff; }
+.lane-key { display: inline-flex; align-items: center; gap: 5px; }
+.lane-key i { width: 9px; height: 9px; border-radius: 2px; display: inline-block; }
+
+.mem { display: grid; grid-template-columns: repeat(auto-fill, minmax(84px, 1fr)); gap: 4px; padding: 0 8px; font: 12px var(--font-mono); font-variant-numeric: tabular-nums; }
+.mem div { border: 1px solid var(--line); border-radius: 5px; padding: 3px 6px; display: flex; justify-content: space-between; gap: 6px; }
+.mem div span { color: var(--muted); }
+.mem div.rd { border-width: 2px; }
+.mem div.wr { color: #fff; font-weight: 600; }
+.mem div.wr span { color: inherit; opacity: .8; }
+.region { grid-column: 1 / -1; font: 600 11px var(--font-body); color: var(--muted); text-transform: uppercase; letter-spacing: .06em; margin-top: 6px; }
+
+.events { font: 13px/1.7 var(--font-mono); padding: 0 14px 12px; display: grid; gap: 0; }
+.err { color: var(--bad); font-weight: 600; }
+.foot { color: var(--muted); font-size: 13px; }
+.foot code { font-family: var(--font-mono); }
+@media (prefers-reduced-motion: no-preference) { .prog li, .regs td, .mem div { transition: background-color .15s; } }
+</style>
+
+<div class="wrap">
+  <header>
+    <div>
+      <h1 id="title">ForgeGPU</h1>
+      <p class="sub" id="sub"></p>
+    </div>
+    <div class="picker" id="picker" role="group" aria-label="Kernel"></div>
+  </header>
+
+  <div class="stats" id="stats"></div>
+
+  <div class="transport">
+    <div class="btns">
+      <button id="first" title="First step (Home)">|&lt;</button>
+      <button id="prev" title="Previous step (←)">&lt;</button>
+      <button id="play" class="primary" title="Play / pause (space)">Play</button>
+      <button id="next" title="Next step (→)">&gt;</button>
+      <button id="last" title="Last step (End)">&gt;|</button>
+    </div>
+    <input type="range" id="scrub" min="0" value="0" aria-label="Step">
+    <div class="pos" id="pos"></div>
+  </div>
+
+  <div class="narr" aria-live="polite">
+    <div class="instr" id="ninstr"></div>
+    <p id="nwhy"></p>
+  </div>
+
+  <div class="grid">
+    <section class="pane">
+      <h2><span>Program</span><span id="blk"></span></h2>
+      <div class="body"><ol class="prog" id="prog"></ol></div>
+    </section>
+    <section class="pane">
+      <h2><span>Registers per lane</span><span id="lanekeys"></span></h2>
+      <div class="body"><table class="regs" id="regs"></table></div>
+      <h2><span>This step</span></h2>
+      <div class="events" id="events"></div>
+    </section>
+    <section class="pane">
+      <h2><span>Data memory</span><span>read ▢ · written ■</span></h2>
+      <div class="body"><div class="mem" id="mem"></div></div>
+    </section>
+  </div>
+
+  <p class="foot">Recorded from the Verilog simulation of <code>hw/gpu.v</code> and checked against the Python reference model.
+  Keys: ← → step, space play/pause.</p>
+</div>
+
+<script>
+const DATA = /*__DATA__*/null;
+const KERNELS = Array.isArray(DATA) ? DATA : [DATA];
+const LANE = i => `var(--lane${i % 4})`;
+let K, states, idx = 0, timer = null;
+
+const $ = id => document.getElementById(id);
+
+function explain(step, k) {
+  const op = step.asm.split(" ")[0];
+  const n = k.lanes;
+  if (op === "halt") return step.last
+    ? "Last block finished. The kernel is done."
+    : `Block ${step.block} finished. The next block starts at the top with fresh registers, so the same program runs again on the next ${n} elements.`;
+  if (op === "ld" || op === "st") return `${op === "ld" ? "Load" : "Store"}: the ${n} lanes share one memory port, so they take turns, one lane per cycle (${n} extra cycles). Real GPUs widen and cache this path because memory, not math, is usually the bottleneck.`;
+  if (op === "bnz") {
+    const br = step.ev.find(e => e[0] === "BR");
+    if (br && br[2]) return "The lanes disagree about this branch (divergence). This GPU has no execution mask yet, so it stops with an error. Real GPUs run both paths with some lanes switched off.";
+    return `Branch ${br && br[1] ? "taken, so the loop runs again" : "not taken, so execution falls through"}. Every lane agreed, so the whole block moves together.`;
+  }
+  if (op === "sreg") return "Each lane reads its own ID. This is how one program works on different data: the lane number picks which element it handles.";
+  if (op === "li") return `Load a constant. All ${n} lanes get the same value in the same cycle.`;
+  if (op === "mul") return `Multiply in all ${n} lanes at once: ${n} products from one instruction in one cycle. That shared fetch/decode is why GPUs are fast at math.`;
+  if (op === "sra") return "Arithmetic shift right by 8 to rescale a fixed-point product (Q16.16 back to Q8.8) while keeping the sign.";
+  if (op === "max") return "max(x, 0) is ReLU, the activation used in most neural networks.";
+  if (op === "slt") return "Compare: 1 if the loop counter is still below the limit. The branch that follows reads it.";
+  return `All ${n} lanes ran this in the same cycle, each on its own registers.`;
+}
+
+function prepare(k) {
+  // Precompute the machine state after every step (small kernels, so this is cheap).
+  const out = [];
+  let regs = Array.from({ length: k.lanes }, () => Array(16).fill(0));
+  const mem = new Map(Object.entries(k.mem).map(([a, v]) => [+a, v]));
+  const touched = new Set(mem.keys());
+  let cyc = 0, prevBlock = 0;
+  k.steps.forEach((s, i) => {
+    if (s.block !== prevBlock) { regs = regs.map(() => Array(16).fill(0)); prevBlock = s.block; }
+    const op = s.asm.split(" ")[0];
+    cyc += 2 + (op === "ld" || op === "st" ? k.lanes : 0);
+    const hits = [], reads = [], writes = [];
+    for (const e of s.ev) {
+      if (e[0] === "WB") { regs[e[1]][e[2]] = e[3]; hits.push([e[1], e[2]]); }
+      if (e[0] === "LD") { regs[e[1]][e[2]] = e[4]; hits.push([e[1], e[2]]); reads.push([e[1], e[3]]); touched.add(e[3]); }
+      if (e[0] === "ST") { mem.set(e[2], e[3]); writes.push([e[1], e[2]]); touched.add(e[2]); }
+    }
+    s.last = i === k.steps.length - 1;
+    out.push({ regs: regs.map(r => r.slice()), mem: new Map(mem), hits, reads, writes, cyc });
+  });
+  return { out, touched: [...touched].sort((a, b) => a - b) };
+}
+
+function load(i) {
+  K = KERNELS[i];
+  states = prepare(K);
+  idx = 0;
+  stop();
+  $("title").textContent = K.title;
+  $("sub").textContent = `${K.stats.grid} block${K.stats.grid > 1 ? "s" : ""} × ${K.lanes} lanes = ${K.stats.grid * K.lanes} threads running one ${K.program.length}-instruction program.`;
+  const st = K.stats;
+  $("stats").innerHTML = [
+    ["instructions issued", st.instructions], ["lane-operations", st.lane_ops],
+    ["cycles", st.cycles], ["cycles waiting on memory", st.mem_cycles],
+  ].map(([l, v]) => `<span>${l} <b>${v}</b></span>`).join("");
+  $("prog").innerHTML = K.program.map((a, n) => `<li data-pc="${n}"><span class="n">${n}</span><span>${a}</span></li>`).join("");
+  $("lanekeys").innerHTML = Array.from({ length: K.lanes }, (_, l) => `<span class="lane-key"><i style="background:${LANE(l)}"></i>${l}</span>`).join(" ");
+  $("scrub").max = K.steps.length - 1;
+  [...$("picker").children].forEach((b, j) => b.setAttribute("aria-pressed", j === i));
+  render();
+}
+
+function render() {
+  const s = K.steps[idx], st = states.out[idx];
+  $("scrub").value = idx;
+  $("pos").textContent = `step ${idx + 1} / ${K.steps.length} · cycle ${st.cyc}`;
+  $("blk").textContent = `block ${s.block}`;
+  const div = s.ev.some(e => e[0] === "BR" && e[2]);
+  $("ninstr").innerHTML = `${s.asm}<span class="where">pc ${s.pc}, block ${s.block}</span>`;
+  $("nwhy").innerHTML = div ? `<span class="err">${explain(s, K)}</span>` : explain(s, K);
+  document.querySelectorAll("#prog li").forEach(li => li.classList.toggle("cur", +li.dataset.pc === s.pc));
+  const cur = document.querySelector("#prog li.cur");
+  if (cur) cur.scrollIntoView({ block: "nearest" });
+
+  const hit = new Set(st.hits.map(([l, r]) => `${l}:${r}`));
+  let h = `<tr><th>reg</th>${Array.from({ length: K.lanes }, (_, l) => `<th style="color:${LANE(l)}">lane ${l}</th>`).join("")}</tr>`;
+  for (let r = 0; r < 16; r++) {
+    h += `<tr><td>r${r}</td>` + st.regs.map((lane, l) => {
+      const v = lane[r], on = hit.has(`${l}:${r}`);
+      return `<td class="${on ? "hit" : v === 0 ? "zero" : ""}"${on ? ` style="background:${LANE(l)}"` : ""}>${v}</td>`;
+    }).join("") + "</tr>";
+  }
+  $("regs").innerHTML = h;
+
+  const rd = new Map(st.reads.map(([l, a]) => [a, l])), wr = new Map(st.writes.map(([l, a]) => [a, l]));
+  let m = "", prev = -2;
+  for (const a of states.touched) {
+    if (a !== prev + 1) m += `<div class="region">from address ${a}</div>`;
+    prev = a;
+    const v = st.mem.get(a) ?? 0;
+    const style = wr.has(a) ? `background:${LANE(wr.get(a))};border-color:${LANE(wr.get(a))}` : rd.has(a) ? `border-color:${LANE(rd.get(a))}` : "";
+    m += `<div class="${wr.has(a) ? "wr" : rd.has(a) ? "rd" : ""}" style="${style}"><span>${a}</span>${v}</div>`;
+  }
+  $("mem").innerHTML = m;
+
+  $("events").innerHTML = s.ev.length ? s.ev.map(e => {
+    const c = e[0] === "BR" ? "var(--ink)" : LANE(e[1]);
+    if (e[0] === "WB") return `<div style="color:${c}">lane ${e[1]}: r${e[2]} = ${e[3]}</div>`;
+    if (e[0] === "LD") return `<div style="color:${c}">lane ${e[1]}: r${e[2]} = mem[${e[3]}] → ${e[4]}</div>`;
+    if (e[0] === "ST") return `<div style="color:${c}">lane ${e[1]}: mem[${e[2]}] = ${e[3]}</div>`;
+    return `<div class="${e[2] ? "err" : ""}">branch ${e[2] ? "DIVERGED" : e[1] ? "taken" : "not taken"}</div>`;
+  }).join("") : `<div style="color:var(--muted)">no register or memory changes</div>`;
+}
+
+function go(n) { idx = Math.max(0, Math.min(K.steps.length - 1, n)); render(); }
+function stop() { clearInterval(timer); timer = null; $("play").textContent = "Play"; }
+function play() {
+  if (timer) return stop();
+  if (idx === K.steps.length - 1) idx = 0;
+  $("play").textContent = "Pause";
+  timer = setInterval(() => { if (idx >= K.steps.length - 1) return stop(); go(idx + 1); }, 450);
+}
+
+$("picker").innerHTML = KERNELS.map((k, i) => `<button type="button" id="k-${k.name}">${k.name.replace(/_/g, " ")}</button>`).join("");
+[...$("picker").children].forEach((b, i) => b.onclick = () => load(i));
+$("first").onclick = () => { stop(); go(0); };
+$("last").onclick = () => { stop(); go(K.steps.length - 1); };
+$("prev").onclick = () => { stop(); go(idx - 1); };
+$("next").onclick = () => { stop(); go(idx + 1); };
+$("play").onclick = play;
+$("scrub").oninput = e => { stop(); go(+e.target.value); };
+document.addEventListener("keydown", e => {
+  if (e.target.tagName === "INPUT" && e.key !== " ") return;
+  if (e.key === "ArrowRight") { stop(); go(idx + 1); }
+  else if (e.key === "ArrowLeft") { stop(); go(idx - 1); }
+  else if (e.key === " ") { e.preventDefault(); play(); }
+  else if (e.key === "Home") { stop(); go(0); }
+  else if (e.key === "End") { stop(); go(K.steps.length - 1); }
+});
+const start = Math.max(0, KERNELS.findIndex(k => k.name === "matmul"));
+load(start);
+// Open on an interesting moment: the first multiply where all lanes produce different, non-zero results.
+const showcase = K.steps.findIndex(s => {
+  const v = s.ev.filter(e => e[0] === "WB").map(e => e[3]);
+  return s.asm.startsWith("mul") && v.length && v.every(x => x !== 0) && new Set(v).size === v.length;
+});
+if (showcase > 0) go(showcase);
+</script>
