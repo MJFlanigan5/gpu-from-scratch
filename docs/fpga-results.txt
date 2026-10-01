@@ -1,0 +1,22 @@
+# FPGA place-and-route results — Yosys 0.33 + nextpnr, 2026-10-01
+# Design: hw/fpga_top.v (board self-test) wrapping hw/gpu.v. Reproduce with tools/fpga_build.sh.
+# "FAIL at N MHz" means the requested clock was too fast; the reported max is what the design meets.
+
+## ECP5 LFE5U-25F (CABGA381) — 4 lanes, matmul self-test
+Device utilisation:
+	              DP16KD:     3/   56     5%
+	          MULT18X18D:    12/   28    42%
+	          TRELLIS_FF:  2173/24288     8%
+	        TRELLIS_COMB: 13983/24288    57%
+Max frequency for clock '$glbnet$clk$TRELLIS_IO_IN': 19.60 MHz (FAIL at 20.00 MHz)   [after routing]
+Program finished normally.
+
+## iCE40 UP5K (SG48) — 2 lanes, mesh_volume self-test
+Device utilisation:
+	         ICESTORM_LC:  4624/ 5280    87%
+	        ICESTORM_RAM:    10/   30    33%
+	        ICESTORM_DSP:     6/    8    75%
+Max frequency for clock 'clk$SB_IO_IN_$glb_clk': 9.42 MHz (FAIL at 12.00 MHz)        [after routing]
+Program finished normally.
+
+## iCE40 UP5K — 4 lanes (synthesis only): ~8,300 LUT4 + 12 DSP needed vs 5,280 LC / 8 DSP available — does not fit.

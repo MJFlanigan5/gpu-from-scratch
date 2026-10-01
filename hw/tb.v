@@ -13,7 +13,8 @@ module tb;
 
     gpu #(.NLANES(`NLANES)) dut (
         .clk(clk), .rst(rst), .start(start), .grid_dim(grid),
-        .done(done), .error(error), .cycles(cycles)
+        .done(done), .error(error), .cycles(cycles),
+        .host_we(1'b0), .host_sel(1'b0), .host_addr(10'd0), .host_wdata(32'd0), .host_rdata()
     );
 
     always #5 clk = ~clk;

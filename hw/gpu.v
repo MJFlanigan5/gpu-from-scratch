@@ -12,9 +12,11 @@
 // Pipeline (multi-cycle, not pipelined — easy to read in a waveform):
 //   FETCH : read instruction at pc
 //   EXEC  : every lane does the ALU op in parallel (1 cycle for all lanes)
-//   MEM   : loads/stores go through ONE memory port, one lane per cycle.
-//           This is the memory bottleneck real GPUs fight with wide,
-//           coalesced memory buses and caches.
+//   MEM   : loads/stores go through ONE memory port, one lane at a time,
+//           2 cycles per lane (issue address, then data returns). The
+//           memory is a plain synchronous RAM with one read and one write
+//           port, so it maps onto real FPGA block RAM. This is the memory
+//           bottleneck real GPUs fight with wide, coalesced buses and caches.
 //
 // Branches must be uniform: if lanes disagree on `bnz`, the core stops with
 // `error` set (divergence). Real GPUs handle this with an execution mask and
@@ -33,12 +35,21 @@ module gpu #(
     input  wire [7:0] grid_dim,
     output reg        done,
     output reg        error,
-    output reg [31:0] cycles
+    output reg [31:0] cycles,
+    // Host port: how the outside world (a PC over UART/USB, a microcontroller)
+    // loads programs and data and reads results. Writes are accepted only
+    // while the core is idle or done.
+    input  wire        host_we,
+    input  wire        host_sel,       // 0 = program memory, 1 = data memory
+    input  wire [9:0]  host_addr,
+    input  wire [31:0] host_wdata,
+    output wire [31:0] host_rdata      // data memory, one cycle after host_addr
 );
-    localparam S_IDLE = 3'd0, S_FETCH = 3'd1, S_EXEC = 3'd2, S_MEM = 3'd3, S_DONE = 3'd4;
+    localparam S_IDLE = 3'd0, S_FETCH = 3'd1, S_EXEC = 3'd2, S_MEM_A = 3'd3, S_MEM_D = 3'd5, S_DONE = 3'd4;
 
-    reg [31:0] pmem [0:PMEM_WORDS-1];          // program memory (loaded by testbench)
-    reg [31:0] dmem [0:DMEM_WORDS-1];          // data memory, shared by all lanes
+    // Block-RAM hints: without them some FPGA flows build these out of logic cells.
+    (* ram_style = "block" *) reg [31:0] pmem [0:PMEM_WORDS-1];   // program memory
+    (* ram_style = "block" *) reg [31:0] dmem [0:DMEM_WORDS-1];   // data memory, shared by all lanes
     reg signed [31:0] rf [0:NLANES*16-1];      // 16 registers per lane
 
     reg [2:0]  state;
@@ -56,7 +67,29 @@ module gpu #(
     integer l, k;
     reg signed [31:0] a, b, res;
     reg any_true, all_true;
-    reg [31:0] addr;
+    reg [31:0] mem_addr;                       // address of the access in flight (for the trace)
+
+    // ---- Memories: one read + one write port each, synchronous read ----
+    // The host owns the ports while the core is idle/done; the core owns
+    // them while running.
+    wire        host_owns  = (state == S_IDLE) || (state == S_DONE);
+    wire [31:0] lane_addr  = rf[mlane*16 + rs] + imm;
+    wire        lane_oob   = lane_addr >= DMEM_WORDS;
+    wire        dmem_we    = host_owns ? (host_we && host_sel)
+                                       : (state == S_MEM_A && op == `OP_ST && !lane_oob);
+    wire [9:0]  dmem_addr  = host_owns ? host_addr : lane_addr[9:0];
+    wire [31:0] dmem_wdata = host_owns ? host_wdata : rf[mlane*16 + rd];
+    reg  [31:0] dmem_q;
+    assign host_rdata = dmem_q;
+
+    always @(posedge clk) begin
+        if (dmem_we) dmem[dmem_addr] <= dmem_wdata;
+        dmem_q <= dmem[dmem_addr];
+    end
+
+    always @(posedge clk) begin
+        if (host_owns && host_we && !host_sel) pmem[host_addr[7:0]] <= host_wdata;
+    end
 
     always @(posedge clk) begin
         if (rst) begin
@@ -104,7 +137,7 @@ module gpu #(
                 end
                 `OP_LD, `OP_ST: begin
                     mlane <= 0;
-                    state <= S_MEM;
+                    state <= S_MEM_A;
                 end
                 `OP_BNZ: begin
                     any_true = 0;
@@ -160,25 +193,36 @@ module gpu #(
                 endcase
             end
 
-            S_MEM: begin
-                addr = rf[mlane*16 + rs] + imm;
-                if (addr >= DMEM_WORDS) begin
+            // Cycle 1 of a lane's access: address goes to the RAM (a store
+            // is written now; a load's data comes back next cycle).
+            S_MEM_A: begin
+                mem_addr <= lane_addr;
+                if (lane_oob) begin
                     error <= 1;              // out-of-bounds access
                     done <= 1;
                     state <= S_DONE;
-                end else if (op == `OP_LD) begin
-                    rf[mlane*16 + rd] <= dmem[addr];
-`ifdef TRACE
-                    $display("T %0d LD lane=%0d rd=%0d addr=%0d val=%0d", cycles, mlane, rd, addr, $signed(dmem[addr]));
-`endif
                 end else begin
-                    dmem[addr] <= rf[mlane*16 + rd];
 `ifdef TRACE
-                    $display("T %0d ST lane=%0d addr=%0d val=%0d", cycles, mlane, addr, rf[mlane*16 + rd]);
+                    if (op == `OP_ST)
+                        $display("T %0d ST lane=%0d addr=%0d val=%0d", cycles, mlane, lane_addr, rf[mlane*16 + rd]);
+`endif
+                    state <= S_MEM_D;
+                end
+            end
+
+            // Cycle 2: load data is ready; move on to the next lane.
+            S_MEM_D: begin
+                if (op == `OP_LD) begin
+                    rf[mlane*16 + rd] <= dmem_q;
+`ifdef TRACE
+                    $display("T %0d LD lane=%0d rd=%0d addr=%0d val=%0d", cycles, mlane, rd, mem_addr, $signed(dmem_q));
 `endif
                 end
                 if (mlane + 1 == NLANES) state <= S_FETCH;
-                else mlane <= mlane + 1;
+                else begin
+                    mlane <= mlane + 1;
+                    state <= S_MEM_A;
+                end
             end
 
             S_DONE: ;

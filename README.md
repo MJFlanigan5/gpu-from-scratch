@@ -22,7 +22,7 @@ sudo apt-get install iverilog        # macOS: brew install icarus-verilog
 python tools/run.py --all            # assemble + simulate every kernel, check the answers
 python tools/run.py matmul --trace   # print every instruction and what each lane did
 python tools/run.py --all --html build/viewer.html   # then open build/viewer.html
-python -m pytest -q                  # 18 tests
+python -m pytest -q                  # 24 tests
 ```
 
 The only dependencies are Python 3.10+ and Icarus Verilog. `--backend ref` runs without
@@ -33,7 +33,7 @@ Sample output:
 ```
 === matmul: Matrix multiply: C = A x B (4x4)
     4 block(s) x 4 lanes = 16 threads, 19 instructions in the program
-    196 instructions issued, 560 ALU lane-operations, 536 cycles (144 of them waiting on the memory port)
+    196 instructions issued, 560 ALU lane-operations, 680 cycles (288 of them waiting on the memory port)
     hardware matched the reference model on every register write, load, store and branch
     PASS: C =
     [9, 2, 3, 2]
@@ -76,16 +76,17 @@ ld   r4, 0(r3)         # so every lane loads a different element
 
 ### 3. Memory is the real bottleneck
 
-The math is cheap and moving data is expensive. ForgeGPU has **one** memory port, so a load
-costs 4 cycles: each lane takes its turn. Across the kernels, 27–38% of all cycles go to
-waiting on memory:
+The math is cheap and moving data is expensive. ForgeGPU has **one** memory port, and like
+real FPGA block RAM it takes a cycle to return data. A load costs 8 cycles: each of the 4
+lanes takes its turn, 2 cycles each. Across the kernels, 42–56% of all cycles go to waiting
+on memory:
 
 | kernel | threads | instructions | ALU lane-ops | cycles | cycles waiting on memory |
 |---|---|---|---|---|---|
-| vector_add | 8 | 20 | 48 | 64 | 24 (38%) |
-| relu_layer | 4 | 47 | 128 | 134 | 40 (30%) |
-| mesh_volume | 12 | 96 | 252 | 312 | 120 (38%) |
-| matmul (4×4) | 16 | 196 | 560 | 536 | 144 (27%) |
+| vector_add | 8 | 20 | 48 | 88 | 48 (55%) |
+| relu_layer | 4 | 47 | 128 | 174 | 80 (46%) |
+| mesh_volume | 12 | 96 | 252 | 432 | 240 (56%) |
+| matmul (4×4) | 16 | 196 | 560 | 680 | 288 (42%) |
 
 Real GPUs fight this with three techniques. **Coalescing** merges 32 neighboring addresses
 into one wide transaction. **Shared memory** is a small on-chip scratchpad, so a matrix tile is
@@ -144,7 +145,7 @@ flowchart LR
 ```
 
 The core is multi-cycle: FETCH (1 cycle), then EXEC (1 cycle, all lanes in parallel), then for
-loads and stores, MEM (1 cycle per lane). A kernel launches over `grid` blocks of 4 threads.
+loads and stores, MEM (2 cycles per lane: address out, data back, as real block RAM works). A kernel launches over `grid` blocks of 4 threads.
 Blocks run one after another, and each block starts with fresh registers.
 
 ### Instruction set
@@ -180,6 +181,57 @@ To add a kernel, write `kernels/<name>.asm` plus `kernels/<name>.py` with `TITLE
 
 ---
 
+## Can we actually build it?
+
+Yes, on a real FPGA board, and the evidence is in this repo. I ran the design through the
+same open-source chip toolchain used for real boards: Yosys for synthesis, then nextpnr for
+place-and-route, which decides where every gate sits on a specific chip and how fast it can
+clock.
+
+| target | board (approx. price) | lanes | logic used | multipliers | block RAM | max clock |
+|---|---|---|---|---|---|---|
+| Lattice **ECP5-25K** | ULX3S ($145–235), Colorlight 5A-75B / i5 (~$15–40) | 4 | 13,983 / 24,288 (57%) | 12 / 28 | 3 / 56 | **19.6 MHz** |
+| Lattice **iCE40 UP5K** | iCEBreaker ($85) | 2 | 4,624 / 5,280 (87%) | 6 / 8 | 10 / 30 | **9.4 MHz** (board crystal is 12 MHz, so divide to 6 MHz) |
+| Lattice iCE40 UP5K | iCEBreaker | 4 | ~8,300 LUTs: **does not fit** | 12 / 8 | — | — |
+
+What you'd flash is `hw/fpga_top.v`, a board self-test. At power-up it loads a kernel from
+on-chip ROM through the GPU's host port, runs it, reads the answers back, and lights a
+**pass** or **fail** LED. The test suite simulates that exact design for every kernel, and
+one test deliberately corrupts an expected value to prove the fail LED works.
+
+```bash
+python tools/fpga_image.py matmul              # build the ROM images (expected answers from the reference model)
+yosys -p "read_verilog -Ihw -Ibuild hw/gpu.v hw/fpga_top.v; synth_ecp5 -top fpga_top -json build/top.json"
+nextpnr-ecp5 --25k --package CABGA381 --json build/top.json --lpf <your-board>.lpf --textcfg build/top.config
+ecppack build/top.config build/top.bit         # then flash with openFPGALoader
+```
+
+Getting the design to fit took two fixes. Both are worth knowing if you build hardware:
+
+1. **Memories must look like real RAM.** The first version read memory instantly, which
+   simulators allow but real block RAM doesn't. The data memory came out as 32,768
+   individual flip-flops, and the iCE40 build needed ~98,000 cells, 10× the chip. Changing
+   to a one-port RAM with a one-cycle read (and paying 2 cycles per lane per load) brought
+   that down to 11,100.
+2. **Use the chip's multiplier blocks.** Four 32-bit multipliers built from logic cells are
+   huge. Mapped onto the FPGA's DSP blocks, they cost 3 blocks each.
+
+Both designs completed place-and-route with no errors (nextpnr, October 2026), so this is a
+real fit on these chips, not an estimate.
+
+**How fast is it?** On the ECP5 at 19.6 MHz, 4 lanes peak at about 39 million integer
+operations per second (4 results every 2 cycles). Matmul actually achieves about 16 million,
+because memory waits eat the rest. The 2-lane iCE40 build manages a few million. That's a learning machine, not a graphics card: a modern GPU does tens of
+trillions. The same open design scales the way real GPUs do, with more lanes and cores,
+pipelining, and wider memory (roadmap phases 4–5). Vortex, an open-source GPU, reaches 32
+cores and 25.6 GFLOPS on a large FPGA at 200 MHz. [[8]](#sources)
+
+**A custom chip?** Possible, but only a cut-down version. A Tiny Tapeout tile holds about
+1,000 logic gates, designs can use up to 16 tiles, the clock runs up to ~66 MHz, and there
+are 24 I/O pins. [[9]](#sources) This design needs about 11,000 cells, so a chip edition
+would be 1–2 lanes, 8-bit data, a few registers, and memory outside the chip. One-person
+Tiny Tapeout GPUs have done exactly that. [[6]](#sources)
+
 ## Roadmap
 
 Each phase ends the same way: every existing kernel still passes on hardware and the reference
@@ -187,7 +239,7 @@ model, and the viewer shows the new behavior.
 
 | phase | goal | what we build | how we know it works |
 |---|---|---|---|
-| **1. Done** | A GPU that computes and that you can watch | 4-lane core, integer ISA, assembler, reference model, 5 kernels, viewer, CI | 18 tests; hardware equals reference event for event |
+| **1. Done** | A GPU that computes and that you can watch | 4-lane core, integer ISA, assembler, reference model, 5 kernels, viewer, CI, FPGA self-test top level | 24 tests; hardware equals reference event for event |
 | **2. Control & cooperation** | Real GPU programming model | Execution mask plus reconvergence stack (divergent `if/else`); `bar` barrier; shared memory per block; `atom.add` | `divergence_demo` passes. **Parallel reduction** sums mesh volume on the GPU instead of the host |
 | **3. Real numbers** | Floating point | `fma` (int and fixed point first), then FP32 add/mul/FMA units (multi-cycle), then BF16 | Bit-exact against Python/NumPy float32 on random tests, including NaN/Inf/denormals |
 | **4. Throughput** | Make it fast, and measure it | Pipeline fetch/exec; wide coalesced memory port; 2–4 cores with a block dispatcher; small cache | Cycle counts in the table above drop, and each change is attributed |
@@ -222,8 +274,8 @@ Use these for study and comparison. They're the reason this design looks the way
 ## Repository layout
 
 ```
-hw/        gpu.v (the GPU), tb.v (testbench), isa.vh (opcodes)
-tools/     isa.py, asm.py, refsim.py (reference model), run.py (runner), viewer.html
+hw/        gpu.v (the GPU), fpga_top.v (board self-test), tb*.v (testbenches), isa.vh (opcodes)
+tools/     isa.py, asm.py, refsim.py (reference model), run.py (runner), viewer.html, fpga_image.py
 kernels/   *.asm programs + *.py setup/check for each
 tests/     pytest suite (ISA sync, assembler, every kernel on both models)
 ```
@@ -237,3 +289,6 @@ tests/     pytest suite (ISA sync, assembler, every kernel on both models)
 5. [Tiny Tapeout](https://tinytapeout.com/), with pricing via [Efabless](https://efabless.com/tinytapeout)
 6. [TinyGPU v2.0 brings 3D graphics to silicon](https://www.opensourceforu.com/2026/08/tinygpu-v2-0-brings-3d-graphics-to-silicon/)
 7. Open GPU projects overview: [Vortex (Phoronix)](https://www.phoronix.com/news/Vortex-RISC-V-GPGPU), [MIAOW](https://miaowgpu.org/)
+8. [Vortex: OpenCL Compatible RISC-V GPGPU (arXiv)](https://arxiv.org/pdf/2002.12151)
+9. Tiny Tapeout [FAQ](https://www.tinytapeout.com/faq/) and [clock spec](https://www.tinytapeout.com/specs/clock/)
+10. Boards: [ULX3S on Crowd Supply](https://crowdsupply.com/radiona/ulx3s); [iCEBreaker (Mouser)](https://www.mouser.in/new/1bitsquared/1bitsquared-icebreaker-fpga-dev-boards/); [Colorlight ECP5 boards (Hackaday)](https://hackaday.com/tag/ecp5/)

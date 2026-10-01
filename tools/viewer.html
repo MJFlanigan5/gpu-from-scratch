@@ -158,7 +158,7 @@ function explain(step, k) {
   if (op === "halt") return step.last
     ? "Last block finished. The kernel is done."
     : `Block ${step.block} finished. The next block starts at the top with fresh registers, so the same program runs again on the next ${n} elements.`;
-  if (op === "ld" || op === "st") return `${op === "ld" ? "Load" : "Store"}: the ${n} lanes share one memory port, so they take turns, one lane per cycle (${n} extra cycles). Real GPUs widen and cache this path because memory, not math, is usually the bottleneck.`;
+  if (op === "ld" || op === "st") return `${op === "ld" ? "Load" : "Store"}: the ${n} lanes share one memory port, so they take turns. Each lane needs 2 cycles (send the address, then the RAM returns data), so this costs ${2 * n} extra cycles. Real GPUs widen and cache this path because memory, not math, is usually the bottleneck.`;
   if (op === "bnz") {
     const br = step.ev.find(e => e[0] === "BR");
     if (br && br[2]) return "The lanes disagree about this branch (divergence). This GPU has no execution mask yet, so it stops with an error. Real GPUs run both paths with some lanes switched off.";
@@ -183,7 +183,7 @@ function prepare(k) {
   k.steps.forEach((s, i) => {
     if (s.block !== prevBlock) { regs = regs.map(() => Array(16).fill(0)); prevBlock = s.block; }
     const op = s.asm.split(" ")[0];
-    cyc += 2 + (op === "ld" || op === "st" ? k.lanes : 0);
+    cyc += 2 + (op === "ld" || op === "st" ? 2 * k.lanes : 0);
     const hits = [], reads = [], writes = [];
     for (const e of s.ev) {
       if (e[0] === "WB") { regs[e[1]][e[2]] = e[3]; hits.push([e[1], e[2]]); }

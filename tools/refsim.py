@@ -52,7 +52,9 @@ def run(program: list[int], mem: list[int], grid: int, lanes: int = 4, max_cycle
                 break
             elif ins.op in ("ld", "st"):
                 for lane in range(lanes):
-                    cycles += 1                             # one lane per cycle through the memory port
+                    # One lane at a time through the single memory port, 2 cycles each:
+                    # issue the address, then the synchronous RAM returns data.
+                    cycles += 1
                     mem_cycles += 1
                     addr = (regs[lane][ins.rs] + ins.imm) & MASK32
                     if addr >= DMEM_WORDS:
@@ -64,6 +66,8 @@ def run(program: list[int], mem: list[int], grid: int, lanes: int = 4, max_cycle
                     else:
                         mem[addr] = regs[lane][ins.rd]
                         events.append(("ST", lane, addr, regs[lane][ins.rd]))
+                    cycles += 1
+                    mem_cycles += 1
             elif ins.op == "bnz":
                 takes = [regs[lane][ins.rs] != 0 for lane in range(lanes)]
                 divergent = any(takes) and not all(takes)
